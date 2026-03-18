@@ -43,6 +43,11 @@
 #include <Python.h>
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
+#if __has_include(<rclcpp/version.h>)
+#include <rclcpp/version.h>
+#elif __has_include(<rclcpp/rclcpp/version.h>)
+#include <rclcpp/rclcpp/version.h>
+#endif
 #include <Eigen/Core>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
@@ -75,6 +80,14 @@ double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
 bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
 /**************************/
+
+#if defined(RCLCPP_VERSION_MAJOR)
+using trigger_request_shared_ptr = std::shared_ptr<std_srvs::srv::Trigger::Request>;
+using trigger_response_shared_ptr = std::shared_ptr<std_srvs::srv::Trigger::Response>;
+#else
+using trigger_request_shared_ptr = std_srvs::srv::Trigger::Request::SharedPtr;
+using trigger_response_shared_ptr = std_srvs::srv::Trigger::Response::SharedPtr;
+#endif
 
 float res_last[100000] = {0.0};
 float DET_RANGE = 300.0f;
@@ -1112,8 +1125,9 @@ private:
         if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
 
-    void map_save_callback(std_srvs::srv::Trigger::Request::ConstSharedPtr req, std_srvs::srv::Trigger::Response::SharedPtr res)
+    void map_save_callback(trigger_request_shared_ptr req, trigger_response_shared_ptr res)
     {
+        (void)req;
         RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
         if (pcd_save_en)
         {
