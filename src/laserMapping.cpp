@@ -32,6 +32,7 @@
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
+#include <geometry_msgs/msg/detail/pose_stamped__struct.hpp>
 #include <omp.h>
 #include <mutex>
 #include <math.h>
@@ -65,6 +66,7 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/vector3.hpp>
 #include <livox_ros_driver2/msg/custom_msg.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
@@ -99,6 +101,9 @@ condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
 string map_file_path, lid_topic, imu_topic;
+bool localization_mode_active = false;
+bool map_to_odom_ready = false;
+geometry_msgs::msg::TransformStamped map_to_odom_trans;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -159,6 +164,10 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+double calc_pos_diff(
+    const geometry_msgs::msg::PoseStamped &current_pose,
+    const geometry_msgs::msg::PoseStamped &last_pose);
 
 void SigHandle(int sig)
 {
@@ -712,6 +721,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
     trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
     tf_br->sendTransform(trans);
+
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -725,9 +735,74 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
     jjj++;
     if (jjj % 10 == 0) 
     {
-        path.poses.push_back(msg_body_pose);
+        geometry_msgs::msg::PoseStamped path_pose = msg_body_pose;
+
+        if (map_to_odom_ready)
+        {
+            Eigen::Quaterniond map_odom_quat(
+                map_to_odom_trans.transform.rotation.w,
+                map_to_odom_trans.transform.rotation.x,
+                map_to_odom_trans.transform.rotation.y,
+                map_to_odom_trans.transform.rotation.z);
+            map_odom_quat.normalize();
+
+            Eigen::Isometry3d T_map_odom = Eigen::Isometry3d::Identity();
+            T_map_odom.linear() = map_odom_quat.toRotationMatrix();
+            T_map_odom.translation() = Eigen::Vector3d(
+                map_to_odom_trans.transform.translation.x,
+                map_to_odom_trans.transform.translation.y,
+                map_to_odom_trans.transform.translation.z);
+
+            Eigen::Quaterniond odom_baselink_quat(
+                msg_body_pose.pose.orientation.w,
+                msg_body_pose.pose.orientation.x,
+                msg_body_pose.pose.orientation.y,
+                msg_body_pose.pose.orientation.z);
+            odom_baselink_quat.normalize();
+
+            Eigen::Isometry3d T_odom_baselink = Eigen::Isometry3d::Identity();
+            T_odom_baselink.linear() = odom_baselink_quat.toRotationMatrix();
+            T_odom_baselink.translation() = Eigen::Vector3d(
+                msg_body_pose.pose.position.x,
+                msg_body_pose.pose.position.y,
+                msg_body_pose.pose.position.z);
+
+            const Eigen::Isometry3d T_map_baselink = T_map_odom * T_odom_baselink;
+            const Eigen::Quaterniond map_baselink_quat(T_map_baselink.rotation());
+
+            path_pose.header.frame_id = "map";
+            path_pose.pose.position.x = T_map_baselink.translation().x();
+            path_pose.pose.position.y = T_map_baselink.translation().y();
+            path_pose.pose.position.z = T_map_baselink.translation().z();
+            path_pose.pose.orientation.w = map_baselink_quat.w();
+            path_pose.pose.orientation.x = map_baselink_quat.x();
+            path_pose.pose.orientation.y = map_baselink_quat.y();
+            path_pose.pose.orientation.z = map_baselink_quat.z();
+        }
+        else
+        {
+            path_pose.header.frame_id = "map";
+        }
+
+        path.header.stamp = path_pose.header.stamp;
+        path.header.frame_id = "map";
+        path.poses.push_back(path_pose);
         pubPath->publish(path);
     }
+}
+
+double calc_pos_diff(
+    const geometry_msgs::msg::PoseStamped &current_pose,
+    const geometry_msgs::msg::PoseStamped &last_pose)
+{
+    const auto &current_pos = current_pose.pose.position;
+    const auto &last_pos = last_pose.pose.position;
+
+    const double dx = current_pos.x - last_pos.x;
+    const double dy = current_pos.y - last_pos.y;
+    const double dz = current_pos.z - last_pos.z;
+
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
@@ -868,6 +943,7 @@ public:
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
+        this->declare_parameter<bool>("mapping_mode", true);
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<bool>("common.time_sync_en", false);
@@ -890,6 +966,9 @@ public:
         this->declare_parameter<int>("point_filter_num", 2);
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
+        this->declare_parameter<double>("localization.jump_max_velocity", 1.0);
+        this->declare_parameter<double>("localization.jump_min_distance", 0.3);
+        this->declare_parameter<string>("localization.reset_service", "/relocalization_reset");
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
         this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
         this->declare_parameter<int>("pcd_save.interval", -1);
@@ -904,6 +983,7 @@ public:
         this->get_parameter_or<bool>("publish.scan_bodyframe_pub_en", scan_body_pub_en, true);
         this->get_parameter_or<int>("max_iteration", NUM_MAX_ITERATIONS, 4);
         this->get_parameter_or<string>("map_file_path", map_file_path, "");
+        this->get_parameter_or<bool>("mapping_mode", mapping_mode, true);
         this->get_parameter_or<string>("common.lid_topic", lid_topic, "/livox/lidar");
         this->get_parameter_or<string>("common.imu_topic", imu_topic,"/livox/imu");
         this->get_parameter_or<bool>("common.time_sync_en", time_sync_en, false);
@@ -926,6 +1006,9 @@ public:
         this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
+        this->get_parameter_or<double>("localization.jump_max_velocity", jump_max_velocity_, 1.0);
+        this->get_parameter_or<double>("localization.jump_min_distance", jump_min_distance_, 0.3);
+        this->get_parameter_or<string>("localization.reset_service", relocalization_service_name_, "/relocalization_reset");
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
         this->get_parameter_or<bool>("mapping.extrinsic_ib_en", extrinsic_ib_en, false);
         this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
@@ -935,11 +1018,13 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_ib_T", extrin_ib_T, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_ib_R", extrin_ib_R, vector<double>());
         
+        localization_mode_active = !mapping_mode;
+        initial_pose_received_ = mapping_mode;
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
         path.header.stamp = this->get_clock()->now();
-        path.header.frame_id ="odom";
+        path.header.frame_id = "map";
 
         // /*** variables definition ***/
         // int effect_feat_num = 0, frame_num = 0;
@@ -1002,6 +1087,13 @@ public:
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        if (!mapping_mode) {
+            load_prior_map();
+            sub_map_to_odom_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+                "/map_to_odom",
+                1,
+                std::bind(&LaserMappingNode::map_to_odom_callback, this, std::placeholders::_1));
+        }
 
         //------------------------------------------------------------------------------------------------------
         auto period_ms = std::chrono::milliseconds(static_cast<int64_t>(1000.0 / 100.0));
@@ -1011,6 +1103,7 @@ public:
         map_pub_timer_ = rclcpp::create_timer(this, this->get_clock(), map_period_ms, std::bind(&LaserMappingNode::map_publish_callback, this));
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
+        relocalization_client_ = this->create_client<std_srvs::srv::Trigger>(relocalization_service_name_);
 
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
@@ -1023,6 +1116,73 @@ public:
     }
 
 private:
+    void load_prior_map()
+    {
+        if (map_file_path.empty())
+        {
+            throw std::runtime_error("mapping_mode=false requires a valid map_file_path");
+        }
+
+        pcl::PointCloud<PointType>::Ptr prior_map(new pcl::PointCloud<PointType>());
+        if (pcl::io::loadPCDFile<PointType>(map_file_path, *prior_map) < 0)
+        {
+            RCLCPP_FATAL(this->get_logger(), "Failed to load prior map from %s", map_file_path.c_str());
+            throw std::runtime_error("Prior map load failed");
+        }
+
+        pcl::PointCloud<PointType>::Ptr filtered_map(new pcl::PointCloud<PointType>());
+        downSizeFilterMap.setInputCloud(prior_map);
+        downSizeFilterMap.filter(*filtered_map);
+        ikdtree.set_downsample_param(filter_size_map_min);
+        ikdtree.Build(filtered_map->points);
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Localization mode enabled, prior map loaded: raw=%zu filtered=%zu",
+            prior_map->size(),
+            filtered_map->size());
+    }
+
+    void map_to_odom_callback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
+    {
+        std::lock_guard<std::mutex> lock(mtx_buffer);
+
+        Eigen::Quaterniond map_odom_quat(
+            msg->pose.pose.orientation.w,
+            msg->pose.pose.orientation.x,
+            msg->pose.pose.orientation.y,
+            msg->pose.pose.orientation.z);
+        map_odom_quat.normalize();
+
+        Eigen::Isometry3d T_map_odom = Eigen::Isometry3d::Identity();
+        T_map_odom.linear() = map_odom_quat.toRotationMatrix();
+        T_map_odom.translation() = Eigen::Vector3d(
+            msg->pose.pose.position.x,
+            msg->pose.pose.position.y,
+            msg->pose.pose.position.z);
+
+        initial_pose_received_ = true;
+        map_to_odom_ready = true;
+        map_to_odom_trans.header.frame_id = "map";
+        map_to_odom_trans.child_frame_id = "odom";
+        map_to_odom_trans.transform.translation.x = T_map_odom.translation().x();
+        map_to_odom_trans.transform.translation.y = T_map_odom.translation().y();
+        map_to_odom_trans.transform.translation.z = T_map_odom.translation().z();
+        map_to_odom_trans.transform.rotation.w = map_odom_quat.w();
+        map_to_odom_trans.transform.rotation.x = map_odom_quat.x();
+        map_to_odom_trans.transform.rotation.y = map_odom_quat.y();
+        map_to_odom_trans.transform.rotation.z = map_odom_quat.z();
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Map->odom correction accepted: [%.3f, %.3f, %.3f]",
+            map_to_odom_trans.transform.translation.x,
+            map_to_odom_trans.transform.translation.y,
+            map_to_odom_trans.transform.translation.z);
+        relocalization_requested_ = false;
+        has_last_monitor_pose_ = false;
+    }
+
     void timer_callback()
     {
         if(sync_packages(Measures))
@@ -1129,12 +1289,17 @@ private:
 
             double t_update_end = omp_get_wtime();
 
+            monitor_localization_jump();
+
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
-            map_incremental();
+            if (mapping_mode)
+            {
+                map_incremental();
+            }
             t5 = omp_get_wtime();
             
             /******* Publish points *******/
@@ -1178,6 +1343,12 @@ private:
 
     void map_publish_callback()
     {
+        if (localization_mode_active && map_to_odom_ready)
+        {
+            map_to_odom_trans.header.stamp = this->get_clock()->now();
+            tf_broadcaster_->sendTransform(map_to_odom_trans);
+        }
+
         if (map_pub_en) publish_map(pubLaserCloudMap_);
     }
 
@@ -1198,6 +1369,74 @@ private:
         }
     }
 
+    void monitor_localization_jump()
+    {
+        if (!localization_mode_active || !initial_pose_received_ || relocalization_requested_)
+        {
+            return;
+        }
+
+        geometry_msgs::msg::PoseStamped current_pose;
+        set_posestamp(current_pose);
+        current_pose.header.stamp = get_ros_time(lidar_end_time);
+        current_pose.header.frame_id = "odom";
+
+        if (!has_last_monitor_pose_)
+        {
+            last_monitor_pose_ = current_pose;
+            has_last_monitor_pose_ = true;
+            return;
+        }
+
+        const double dt = std::max(
+            (current_pose.header.stamp.sec - last_monitor_pose_.header.stamp.sec) +
+            (current_pose.header.stamp.nanosec - last_monitor_pose_.header.stamp.nanosec) * 1e-9,
+            1e-3);
+        const double pos_jump = calc_pos_diff(current_pose, last_monitor_pose_);
+        const double expected_max = std::max(jump_min_distance_, jump_max_velocity_ * dt * 2.0);
+
+        if (pos_jump > expected_max)
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Localization jump detected! %.3fm (expected <= %.3fm, dt=%.3fs)",
+                pos_jump,
+                expected_max,
+                dt);
+            request_relocalization();
+            return;
+        }
+
+        last_monitor_pose_ = current_pose;
+    }
+
+    void request_relocalization()
+    {
+        if (!relocalization_client_->wait_for_service(std::chrono::milliseconds(100)))
+        {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Relocalization reset service %s is unavailable.",
+                relocalization_service_name_.c_str());
+            return;
+        }
+
+        map_to_odom_ready = false;
+        initial_pose_received_ = false;
+        relocalization_requested_ = true;
+        has_last_monitor_pose_ = false;
+        path.poses.clear();
+        path.header.stamp = this->get_clock()->now();
+        path.header.frame_id = "map";
+
+        auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+        relocalization_client_->async_send_request(request);
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Relocalization reset requested via %s.",
+            relocalization_service_name_.c_str());
+    }
+
 private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
@@ -1208,17 +1447,27 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr sub_map_to_odom_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
+    rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr relocalization_client_;
 
     bool effect_pub_en = false, map_pub_en = false;
     int effect_feat_num = 0, frame_num = 0;
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
+    bool mapping_mode;
+    bool initial_pose_received_{false};
+    bool has_last_monitor_pose_{false};
+    bool relocalization_requested_{false};
+    double jump_max_velocity_{1.0};
+    double jump_min_distance_{0.3};
+    string relocalization_service_name_{"/relocalization_reset"};
+    geometry_msgs::msg::PoseStamped last_monitor_pose_;
 
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;

@@ -78,7 +78,7 @@ set(dependencies
 
 # Thirdparty libraries
 find_package(Eigen3 REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common io)
+find_package(PCL REQUIRED COMPONENTS common io filters registration)
 
 message(Eigen: ${EIGEN3_INCLUDE_DIR})
 message(STATUS "PCL: ${PCL_INCLUDE_DIRS}")
@@ -115,8 +115,17 @@ endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
 
+add_executable(fastlio_localization src/localization.cpp)
+target_include_directories(fastlio_localization PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
+)
+target_link_libraries(fastlio_localization ${PCL_LIBRARIES} Eigen3::Eigen)
+ament_target_dependencies(fastlio_localization ${dependencies})
+
 # ---------------- Install --------------- #
-install(TARGETS fastlio_mapping
+install(TARGETS fastlio_mapping fastlio_localization
   DESTINATION lib/${PROJECT_NAME}
 )
 
